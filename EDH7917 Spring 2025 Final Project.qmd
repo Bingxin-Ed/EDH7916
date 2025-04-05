@@ -1,0 +1,591 @@
+---
+title: "EDH7916 Final Project"
+author: Bingxin Cao
+format: 
+  pdf:
+    graphics-device: ragg_pdf
+    execute:
+      message: false
+      warning: false
+      echo: false
+      results: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+#### Instruction to Run
+
+Four .csv data files from NCES are used for this project. Two Public School Enrollment data from CCD in schoolyear 22-23 and 23-24 and Urbanicity of schools data from EDGE in schoolyear 22-23 and 23-24. These can be downloaded from [here](https://nces.ed.gov/ccd/files.asp#Fiscal:2,LevelId:7,SchoolYearId:38,Page:1) (CCD) by clicking "Non-fiscal, school level, 2023-2024/2022-2023, Membership" and [here](https://nces.ed.gov/programs/edge/Geographic/SchoolLocations) (EDGE) by clicking on “Public School File” under 2023-24 and 2022-23. To run this code, save these files in a sub-folder called “data” that sits in the same folder as this .qmd file.
+
+#### Topic
+
+The school choice movement has significantly reshaped the U.S. education system over the past decade. A persistent focus of heated debate has been whether school choice programs alleviate or exacerbate racial segregation. With the passage of House Bill 1 (HB1) in 2023, Florida became the second state to establish a universal school voucher system, removing income caps from the Family Empowerment Scholarship (FES) Program and making all K–12 students eligible for state-funded alternatives such as private schools. According to Step Up For Students (2025), 344,000 students were funded during the 2023–2024 academic year. This project will contribute to the debate by evaluating HB1’s potential impact on changes in school-level racial composition across areas of geographic features.
+
+#### Data
+
+This project uses two datasets, namely, Common Core Data (CCD) and Educational Demographic and geographic Estimates (EDGE). Both are from NCES. CCD data non-fiscal data has all the enrollment data of schools and EDGE data has the geographic information. School year 2022-23 and 2023-24 are selected, which means one year before and one year after the voucher expansion policy.
+
+#### Analysis Method
+
+1.  Values in datasets are cleaned by selecting schools that have enrollments across four datasets so the comparisons overtime can be conducted.
+
+2.  Raw data only include school enrollment data by race, sex, and grade. A lot of data wrangling has been done to summarize and combine datasets, and check missing values. 
+
+3.  Main computed variable is the school diversity indicator, which is Simpson’s Diversity Index (SDI). The school-level DI measures the probability that two randomly chosen students belong to different racial groups, calculated by first computing each group’s share of the total and squaring those shares, then summing all of those squared shares and subtracting that sum from one. Another computed variable is district-level DI, which is the mean of DIs of schools within the district.
+
+```{r}
+#| label: Read in packages
+library(tidyverse) 
+library(sf) 
+library(tidycensus)
+library(tigris)
+library(ggplot2)
+```
+
+```{r}
+#|label: Institutional data wrangling Part 1 - loading data and cleaning data
+#|include: FALSE
+#|results: hide
+
+# Read in data
+library(openxlsx)
+
+#CCD
+ccd2223 <- read.csv("data/ccd_sch_052_2223_l_1a_083023 copy.csv")
+ccd2324 <- read.csv("data/ccd_sch_052_2324_l_1a_073124 copy.csv")
+
+#EDGE
+edge2223 <- read.xlsx("data/EDGE_GEOCODE_PUBLICSCH_2223 copy.xlsx")
+edge2324 <- read.xlsx("data/EDGE_GEOCODE_PUBLICSCH_2324 copy.xlsx")
+
+# 1.1a get state == FL from CCD data
+FL2223ccd <- ccd2223|>
+  filter(ST == "FL")
+FL2324ccd <- ccd2324|>
+  filter(ST == "FL")
+
+# 1.1b get state == FL from EDGE data
+FL2223edge <- edge2223|>
+  filter(STATE == "FL")
+FL2324edge <- edge2324|>
+  filter(STATE == "FL")
+
+
+#1.2 check na
+# sum(is.na(FL2223ccd))
+# sum(is.na(FL2324ccd))
+# sum(is.na(FL2223edge))
+# sum(is.na(FL2324edge))
+
+#It shows ccd datasets have many NAs. Geo datasets have none.
+
+#1.3a get needed columns in CCD data
+#So, I select necessary columns first and see if it can avoid dealing with NAs.
+FL2223ccd <- FL2223ccd |>
+  select(SCHOOL_YEAR, SCH_NAME, LEAID, NCESSCH, GRADE, RACE_ETHNICITY, SEX, STUDENT_COUNT)
+FL2324ccd <- FL2324ccd |>
+  select(SCHOOL_YEAR, SCH_NAME, LEAID, NCESSCH, GRADE, RACE_ETHNICITY, SEX, STUDENT_COUNT)
+
+#Then check na again.
+# sum(is.na(FL2223ccd))
+# sum(is.na(FL2324ccd))
+
+#Now the NAs are none in CCD datasets.
+
+#1.3b get needed columns in EDGE data and make sure columns' name aligned with ccd data if overlapping
+FL2223edge <- FL2223edge|>
+  select(NCESSCH, NMCNTY, LOCALE, LAT, LON, SCHOOLYEAR)
+FL2324edge <- FL2324edge|>
+  select(NCESSCH, NMCNTY, LOCALE, LAT, LON, SCHOOLYEAR)
+```
+
+```{r}
+#| label: Institution data wrangling Part 2 - Computing racial numbers, percentages, and segregation index
+#| include: false
+# Step2. Make CCD data wider and get racial percentage of each school.
+#2.1 dealing with string type
+FL2223ccd <- FL2223ccd |>
+  mutate(across(c(SCHOOL_YEAR, SCH_NAME, LEAID, NCESSCH, GRADE, RACE_ETHNICITY, SEX), as.factor))
+str(FL2223ccd$STUDENT_COUNT)
+
+FL2324ccd <- FL2324ccd |>
+  mutate(across(c(SCHOOL_YEAR, SCH_NAME, LEAID, NCESSCH, GRADE, RACE_ETHNICITY, SEX), as.factor))
+str(FL2223ccd$STUDENT_COUNT)
+
+#2.2a reshaping ccd data to get total enrollment，# and % of each race for 22-23
+library(dplyr)
+library(tidyr)
+
+# 2.2a.1 # of each race & total enrollment
+race_summary2223 <- FL2223ccd |>
+  group_by(NCESSCH, RACE_ETHNICITY) |>
+  summarise(TT_COUNT = sum(STUDENT_COUNT), .groups = "drop")
+
+# 2.2a.2 make it wider
+race_counts2223 <- race_summary2223 |>
+  pivot_wider(
+    names_from = RACE_ETHNICITY,
+    values_from = TT_COUNT,
+    names_prefix = "TT_"
+  )
+
+# 2.2a.3 geting percentage of each racial subgroup
+race_counts2223 <- race_counts2223 %>%
+  mutate(TTENROLL = rowSums(select(., starts_with("TT_")))) %>%
+  mutate(
+    ASIAN_PER    = TT_Asian / TTENROLL,
+    NATIVE_PER   = `TT_American Indian or Alaska Native` / TTENROLL,
+    BLACK_PER    = `TT_Black or African American` / TTENROLL,
+    HISPANIC_PER = `TT_Hispanic/Latino` / TTENROLL,
+    ISLANDER_PER = `TT_Native Hawaiian or Other Pacific Islander` / TTENROLL,
+    WHITE_PER    = TT_White / TTENROLL,
+    RACE_PER     = `TT_Two or more races` / TTENROLL,
+    NSPER        = `TT_Not Specified` / TTENROLL,
+    NOCATEG_PER  = `TT_No Category Codes` / TTENROLL
+  ) %>%
+  mutate(
+    SIMPSON_DI = 1 - (
+      (TT_Asian / TTENROLL)^2 +
+      (`TT_American Indian or Alaska Native` / TTENROLL)^2 +
+      (`TT_Black or African American` / TTENROLL)^2 +
+      (`TT_Hispanic/Latino` / TTENROLL)^2 +
+      (`TT_Native Hawaiian or Other Pacific Islander` / TTENROLL)^2 +
+      (TT_White / TTENROLL)^2 +
+      (`TT_Two or more races` / TTENROLL)^2 +
+      (`TT_Not Specified` / TTENROLL)^2 +
+      (`TT_No Category Codes` / TTENROLL)^2
+    )
+  ) %>%
+  mutate(SCHOOLYEAR = "2022-2023")
+
+# 2.2a.4 check na
+sum(is.na(race_counts2223))
+sum(race_counts2223$TTENROLL == 0)
+# All 201*10 NAs are generated because the denominators (TTENROLL) are 0.
+
+
+#2.2b doing same with 2324 ccd data
+# 2.2b.1 # of each race & total enrollment
+race_summary2324 <- FL2324ccd |>
+  group_by(NCESSCH, RACE_ETHNICITY) |>
+  summarise(TT_COUNT = sum(STUDENT_COUNT), .groups = "drop")
+
+# 2.2b.2 make it wider
+race_counts2324 <- race_summary2324 |>
+  pivot_wider(
+    names_from = RACE_ETHNICITY,
+    values_from = TT_COUNT,
+    names_prefix = "TT_"
+  )
+# 2.2b.3 computing percentages
+race_counts2324 <- race_counts2324 %>%
+  mutate(TTENROLL = rowSums(select(., starts_with("TT_")))) %>%
+  mutate(
+    ASIAN_PER    = TT_Asian / TTENROLL,
+    NATIVE_PER   = `TT_American Indian or Alaska Native` / TTENROLL,
+    BLACK_PER    = `TT_Black or African American` / TTENROLL,
+    HISPANIC_PER = `TT_Hispanic/Latino` / TTENROLL,
+    ISLANDER_PER = `TT_Native Hawaiian or Other Pacific Islander` / TTENROLL,
+    WHITE_PER    = TT_White / TTENROLL,
+    RACE_PER     = `TT_Two or more races` / TTENROLL,
+    NSPER        = `TT_Not Specified` / TTENROLL,
+    NOCATEG_PER  = `TT_No Category Codes` / TTENROLL
+  ) %>%
+  mutate(
+    SIMPSON_DI = 1 - (
+      (TT_Asian / TTENROLL)^2 +
+      (`TT_American Indian or Alaska Native` / TTENROLL)^2 +
+      (`TT_Black or African American` / TTENROLL)^2 +
+      (`TT_Hispanic/Latino` / TTENROLL)^2 +
+      (`TT_Native Hawaiian or Other Pacific Islander` / TTENROLL)^2 +
+      (TT_White / TTENROLL)^2 +
+      (`TT_Two or more races` / TTENROLL)^2 +
+      (`TT_Not Specified` / TTENROLL)^2 +
+      (`TT_No Category Codes` / TTENROLL)^2
+    )
+  ) %>%
+  mutate(SCHOOLYEAR = "2023-2024")
+
+# 2.2b.4 check na
+sum(is.na(race_counts2324))
+sum(race_counts2324$TTENROLL == 0)
+# All 195*10 NAs are generated because the denominators (TTENROLL) are 0.
+
+# 2.3 Get rid of NAs caused by denominator = 0
+race_counts2223 <- race_counts2223 |> drop_na()
+race_counts2324 <- race_counts2324 |> drop_na()
+
+sum(is.na(race_counts2223))
+sum(is.na(race_counts2324))
+# Now the CCD datasets are clean.
+```
+
+```{r}
+#| label: Institutional data wrangling Part 3 - joining data
+#| include: false
+# Step3. Join the EDGE data and CCD data
+#I use NCESSCH as bridge column because each school is assigned a unique identifier in the NCESSCH column.
+  
+#3.1 make sure two datasets are joinable
+#check difference by NCES school ID
+identical(race_counts2223$NCESSCH, race_counts2324$NCESSCH)
+identical(FL2223edge$NCESSCH, FL2324edge$NCESSCH)
+
+diffschoolchangeinfo <- anti_join(race_counts2223, race_counts2324, by = "NCESSCH")
+# It shows 59 obs. all in 22-23. It seems some school closed.
+
+diffedgechangeinfo <- anti_join(FL2223edge, FL2324edge, by = "NCESSCH")
+# It shows 1 obs. all in 23-24. It seems some school opened.
+
+identical(diffschoolchangeinfo$NCESSCH, diffedgechangeinfo$NCESSCH)
+diffschooledgeinfo <- anti_join(diffschoolchangeinfo, diffedgechangeinfo, by = "NCESSCH")
+# 58 obs. overlap.
+
+#3.2 inner_join datasets 
+# Because the research focuses on the change over time. So, I decide to use inner_join to make sure the population are schools that exist in both years and that exist in both datasets.
+data2223innerjoin <- inner_join(race_counts2223, FL2223edge, by = "NCESSCH")
+sum(is.na(data2223innerjoin))
+
+data2324innerjoin <- inner_join(race_counts2324, FL2324edge, by = "NCESSCH")
+sum(is.na(data2324innerjoin))
+# After inner joining, 0 NAs show as expected.
+
+# delete repeated columns
+data2223 <- data2223innerjoin|>
+  mutate(SCHOOLYEAR = "2022-2023")|>
+  select(-SCHOOLYEAR.x, -SCHOOLYEAR.y)
+data2324 <- data2324innerjoin|>
+  mutate(SCHOOLYEAR = "2023-2024")|>
+  select(-SCHOOLYEAR.x, -SCHOOLYEAR.y)
+
+# Step3.3 make all into one 
+data <- bind_rows(data2223, data2324)|> arrange(NCESSCH)
+```
+
+```{r}
+#| label: Instution map
+#| include: false
+head(data)
+data_coored <- data |> 
+  st_as_sf(coords = c("LON", "LAT"))
+
+data_crsset <- data_coored |> 
+  st_set_crs(4326)
+st_crs(data_crsset)
+
+library(scales)
+
+str(data_crsset$SCHOOLYEAR)
+
+# adjust levels of index
+mean_simpson_2223 <- data_crsset |>
+  filter(SCHOOLYEAR == "2022-2023") |>
+  summarise(mean_simpson = mean(SIMPSON_DI, na.rm = TRUE)) |>
+  pull(mean_simpson)
+
+mean_simpson_2324 <- data_crsset |>
+  filter(SCHOOLYEAR == "2023-2024") |>
+  summarise(mean_simpson = mean(SIMPSON_DI, na.rm = TRUE)) |>
+  pull(mean_simpson)
+
+```
+
+```{r}
+#|label: table - 1
+#| include: false
+library("knitr")
+# Table 1: Summary of Racial Composition by School Year
+#| label: tbl-1
+#| tbl-cap: Summary of Racial Composition by School Year
+#| tbl-align: center
+data|>
+  group_by(as_factor(SCHOOLYEAR))|>
+  summarize(mean = mean(SIMPSON_DI, na.rm = TRUE),
+            median = median(SIMPSON_DI, na.rm = TRUE),
+            min = min(SIMPSON_DI, na.rm = TRUE),
+            max = max(SIMPSON_DI, na.rm = TRUE))|>
+  kable(col.names = c("School Year", "Mean", "Median", "Min", "Max"), digits = 3,
+                      caption = "Summary of Racial Composition by School Year")
+              
+```
+
+```{r}
+#| label: County level diversity and base map data
+#| include: false
+
+#Step5. Computing county level diversity index = mean DI of schools within the county
+data <- data |>
+  group_by(SCHOOLYEAR, NMCNTY) |>
+  mutate(MEAN_DIST_DI = mean(SIMPSON_DI, na.rm = TRUE)) |>
+  ungroup()
+anyNA(data$MEAN_DIST_DI)
+
+# make a base map of Florida counties and join ACS data with institutional data
+flcountybasemap_by_mean_di <- counties(state = "FL", cb = TRUE, class = "sf") |>
+  full_join(data, by = c("NAMELSAD" = "NMCNTY")) |>
+  mutate(MEAN_DIST_DI = ifelse(is.na(MEAN_DIST_DI), 0, MEAN_DIST_DI))
+```
+
+```{r}
+#|label: p1
+#| include: false
+# p1: county level diversity change comparison between pre and post the school voucher policy 
+p1_preandpost <- ggplot(flcountybasemap_by_mean_di) +
+  geom_sf(aes(fill = MEAN_DIST_DI), color = "white", size = 0.2) +
+  scale_fill_gradient(low = "blue", high = "orange", na.value = "grey90") +
+  labs(title = "Plot 1: County Level Diversity Change Comparison over HB1",
+       fill = "School Diversity by District") +
+  facet_wrap(~ SCHOOLYEAR) +
+  theme_minimal() +
+  theme(panel.spacing = unit(2, "lines"),
+        axis.text.x = element_text(size = 4),  
+        axis.text.y = element_text(size = 4),
+        legend.key.size   = unit(0.4, "cm"),
+        legend.text       = element_text(size = 6),
+        legend.title      = element_text(size = 8),
+        plot.title = element_text(size = 10))
+p1_preandpost
+ggsave("p1_preandpost.png")
+```
+
+```{r}
+#|label: p2
+#|include: false
+# p2: change in mean diversity index by district as basemap
+# computing change
+data_with_diff <- flcountybasemap_by_mean_di |>
+  arrange(NCESSCH, SCHOOLYEAR) |>
+  group_by (NCESSCH) |>
+  mutate(school_diff = SIMPSON_DI - lag(SIMPSON_DI, order_by = SCHOOLYEAR)) |>
+  ungroup()
+
+county_level <- data_with_diff |>
+  distinct(NAMELSAD, SCHOOLYEAR, MEAN_DIST_DI)
+
+county_level <- county_level |>
+  arrange(NAMELSAD, SCHOOLYEAR) |>
+  group_by(NAMELSAD) |>
+  mutate(district_diff = MEAN_DIST_DI - lag(MEAN_DIST_DI)) |>
+  ungroup()
+
+data_with_diff <- data_with_diff |>
+  left_join(county_level |> select(NAMELSAD, SCHOOLYEAR, district_diff),
+            by = c("NAMELSAD", "SCHOOLYEAR"))
+
+# make the plot of change in one map
+p2_naandchange <- ggplot(data_with_diff) + 
+  geom_sf(aes(fill = district_diff), color = "white", size = 0.2) +
+  scale_fill_gradient2(low = "blue",   
+                        mid = "white",  
+                        high = "orange",
+                        midpoint = 0,
+                        na.value = "grey90") +
+  labs(title = "Plot 2: Change in Simpson's Diversity Index (Pre and Post HB1)",
+       fill = "District Level Racial Diversity Change") +
+  facet_wrap(~ SCHOOLYEAR) +
+  theme_minimal() +
+  theme(panel.spacing = unit(2, "lines"),
+        axis.text.x = element_text(size = 6),  
+        axis.text.y = element_text(size = 6),
+        plot.title = element_text(size = 10),
+        legend.key.size   = unit(0.4, "cm"),
+        legend.text       = element_text(size = 6),
+        legend.title      = element_text(size = 6))
+  
+p2_naandchange
+ggsave("p2_naandchange.png")
+
+#create a basemap for p3a and p3b
+data_year2only <- data_with_diff |>
+  filter(SCHOOLYEAR == "2023-2024")
+
+p3base_change_only <- ggplot(data_year2only) + 
+  geom_sf(aes(fill = district_diff), color = "white", size = 0.2) +
+  scale_fill_gradient2(low = "blue",   
+                       mid = "white",  
+                       high = "orange",
+                       midpoint = 0,
+                       na.value = "grey90") +
+  labs(title = "Change in Simpson's Diversity Index (Post HB1)",
+       fill = "District Level Diversity Change") +
+  theme_minimal()
+```
+
+```{r}
+#|label: p3a
+#|include: false
+# p3a: top 10 schools of diversity increased the most
+top10_DI_increased <- data_with_diff |>
+  filter(school_diff > 0) |>
+  arrange(desc(school_diff)) |>
+  slice_head(n = 10) 
+
+top10_DI_increased <- top10_DI_increased |>
+  st_drop_geometry()  
+
+top10_DI_increased <- top10_DI_increased |>
+  select(NCESSCH, school_diff, LON, LAT, LOCALE) |>
+  mutate(
+    SUBREGION = case_when(
+      LOCALE == 11 ~ "Large City",
+      LOCALE == 12 ~ "Mid Size City",
+      LOCALE == 13 ~ "Small City",
+      LOCALE == 21 ~ "Large Suburban",
+      LOCALE == 22 ~ "Mid Size Suburban",
+      LOCALE == 23 ~ "Small Suburban",
+      LOCALE == 31 ~ "Large Town",
+      LOCALE == 32 ~ "Mid Size Town",
+      LOCALE == 33 ~ "Small Town",
+      LOCALE == 41 ~ "Large Rural",
+      LOCALE == 42 ~ "Mid Size Rural",
+      LOCALE == 43 ~ "Small Rural",
+      TRUE         ~ NA_character_),
+    SUBREGION = factor(
+      SUBREGION,
+      levels = c(
+        "Large City",   "Mid Size City",   "Small City",
+        "Large Suburban","Mid Size Suburban","Small Suburban",
+        "Large Town",   "Mid Size Town",    "Small Town",
+        "Large Rural",  "Mid Size Rural",   "Small Rural")))|>
+  st_as_sf(coords = c("LON", "LAT"), crs = 4269)
+
+# make sure the datasets use the same crs
+# st_crs(top10_DI_increased)
+# st_crs(data_with_diff)
+
+unique_levels_a <- levels(top10_DI_increased$SUBREGION)
+color_values_a <- rep("red", length(unique_levels_a))
+names(color_values_a) <- unique_levels_a
+
+p3a_top10increase <- p3base_change_only +
+  geom_sf(data = top10_DI_increased, 
+          aes(size = school_diff, color = SUBREGION),
+          alpha = 0.8,        
+          shape = 21,         
+          size = 1,
+          fill = "red") +  
+  scale_color_manual(name = "Region Type of School Identified", 
+                     values = color_values_a) +
+  scale_size_continuous(labels = comma) +
+  ggtitle("Plot 3a: The Top 10 Florida Schools with the Most Increased Diversity Post HB1") +
+  theme(legend.key.size   = unit(0.4, "cm"),
+        legend.text       = element_text(size = 6),
+        legend.title      = element_text(size = 8),
+        plot.title = element_text(size = 10))
+
+p3a_top10increase
+ggsave("p3a_top10increase.png")
+```
+
+```{r}
+#|label: p3b
+#|include: false
+#p4b top 10 schools of the most segregated
+top10_DI_decreased <- data_with_diff |>
+  filter(school_diff < 0) |>
+  arrange(school_diff) |>             
+  slice_head(n = 10)
+
+top10_DI_decreased <- top10_DI_decreased |>
+  st_drop_geometry() |>
+  select(NCESSCH, school_diff, LON, LAT, LOCALE) |>
+  mutate(
+    SUBREGION = case_when(
+      LOCALE == 11 ~ "Large City",
+      LOCALE == 12 ~ "Mid Size City",
+      LOCALE == 13 ~ "Small City",
+      LOCALE == 21 ~ "Large Suburban",
+      LOCALE == 22 ~ "Mid Size Suburban",
+      LOCALE == 23 ~ "Small Suburban",
+      LOCALE == 31 ~ "Large Town",
+      LOCALE == 32 ~ "Mid Size Town",
+      LOCALE == 33 ~ "Small Town",
+      LOCALE == 41 ~ "Large Rural",
+      LOCALE == 42 ~ "Mid Size Rural",
+      LOCALE == 43 ~ "Small Rural",
+      TRUE         ~ NA_character_),
+    SUBREGION = factor(
+      SUBREGION,
+      levels = c(
+        "Large City",   "Mid Size City",   "Small City",
+        "Large Suburban","Mid Size Suburban","Small Suburban",
+        "Large Town",   "Mid Size Town",    "Small Town",
+        "Large Rural",  "Mid Size Rural",   "Small Rural")))|>
+  st_as_sf(coords = c("LON", "LAT"), crs = 4269)
+
+unique_levels_b <- levels(top10_DI_increased$SUBREGION)
+color_values_b <- rep("black", length(unique_levels_b))
+names(color_values_b) <- unique_levels_b
+
+p3b_top10decrease <- p3base_change_only +
+  geom_sf(data = top10_DI_decreased, 
+          aes(size = school_diff, color = SUBREGION),
+          alpha = 0.8,        
+          shape = 21,         
+          size = 1,
+          fill = "black") +  
+  scale_color_manual(name = "Region Type of School Identified", 
+                     values = color_values_b) +
+  scale_size_continuous(labels = comma) +
+  ggtitle("Plot 3b: The Top 10 Florida Schools with the Most Decreased Diversity Post HB1") +
+  theme(legend.key.size   = unit(0.4, "cm"),
+        legend.text       = element_text(size = 6),
+        legend.title      = element_text(size = 8),
+        plot.title = element_text(size = 10))
+
+p3b_top10decrease
+ggsave("p3b_top10decrease.png")
+```
+
+```{r}
+#|label: table2
+#|include: false
+# Table 2: Summary of Racial Composition by School Year
+#| label: tbl-2
+#| tbl-cap: Summary of School Diversity Change by Locale
+#| tbl-align: center
+
+table2 <- data_with_diff |>
+  select(LOCALE, school_diff, SCHOOLYEAR) |>
+  st_drop_geometry()|>
+  mutate(
+    SUBREGION = case_when(
+      LOCALE == 11 ~ "Large City",
+      LOCALE == 12 ~ "Mid Size City",
+      LOCALE == 13 ~ "Small City",
+      LOCALE == 21 ~ "Large Suburban",
+      LOCALE == 22 ~ "Mid Size Suburban",
+      LOCALE == 23 ~ "Small Suburban",
+      LOCALE == 31 ~ "Large Town",
+      LOCALE == 32 ~ "Mid Size Town",
+      LOCALE == 33 ~ "Small Town",
+      LOCALE == 41 ~ "Large Rural",
+      LOCALE == 42 ~ "Mid Size Rural",
+      LOCALE == 43 ~ "Small Rural"))|>
+  filter(SCHOOLYEAR == "2023-2024") |>
+  group_by(SUBREGION) |>
+  summarize(
+     Count_of_Becoming_Diversified = sum(school_diff > 0, na.rm = TRUE),
+    Count_of_Becoming_Segregated  = sum(school_diff < 0, na.rm = TRUE),
+    .groups = "drop")|>
+  kable(col.names = c("SUBREGION", 
+                  "Count of Schools Becoming Diversified", 
+                  "Count of Schools Becoming Segregated"), caption = "Summary of School Diversity Change by Locale")
+table2
+```
+
+#### Findings
+
+Table 1 descriptively summarizes the mean, median, minimum, and maximum values of school DIs in each school year. Plot 1 provides a visual comparison of the status of district level DI pre and post HB1. No significant change is observed from the table and plot. It shows urban areas such as Tampa and Miami, and some north counties are more segregated than others. 
+
+Plot 1 provides a visual comparison of the status of district level DI pre and post HB1. It shows urban areas such as Tampa and Miami, and some north counties are more segregated than others. No significant change is observed. 
+
+Plot 2 allows a closer look on the change. Some districts are more diversified in student race and some are more segregated. The districts with the greatest segregation trend among others stand out with the color contrast. They include Liberty, Jackson, and Franklin, all in north Florida. In addition, we can tell from the colorbar that although the change is small, the degree of segregation trend seems larger than diversification, which is consistent with the effect of charter school introduction in the previous findings.
+
+Plot 3a and Plot 3b marks top 10 schools with the most increase and decreased diversity change over HB1 policy. Schools with the greatest increase in diversity are reflected in their district's changes in racial diversity, and Schools with the greatest increase in segregation are not always reflected in their district's changes in racial diversity. Schools with the greatest increase in diversity are across 7 out of 12 types of geographic features, mostly in city and rural areas. In contrast,  schools with the greatest increase in diversity are across 6 out of 12 types of geographic features, mostly in suburban and rural areas.
+
+Table 2 summarizes the count of school diversity change by locale. It is found that except for small towns, schools becoming diversed are more than those becoming segregated. 
+
+#### Summary
+
+Overall, no significant segregation trend at schools in Florida is found with the enactment of  the voucher expansion policy of HB1, at this early-stage timing. Most schools are becoming slightly diversified.  However, the degree of segregation trend seems larger than diversification. This finding suggests a warranted need to continually monitor the potential segregation trend in the longer term, especially in suburban and rural areas.
